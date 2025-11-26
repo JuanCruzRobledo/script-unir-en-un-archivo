@@ -2,6 +2,7 @@
 """
 Batch Java Project Consolidator
 Procesa múltiples entregas de proyectos Java de forma automática
+Incluye detección de copias totales y parciales entre proyectos
 """
 
 import os
@@ -9,9 +10,12 @@ import sys
 import zipfile
 import tempfile
 import shutil
+import hashlib
+import json
 from pathlib import Path
 from datetime import datetime
-from typing import List, Set, Dict
+from typing import List, Set, Dict, Tuple
+from collections import defaultdict
 
 
 class BatchProjectConsolidator:
@@ -130,7 +134,56 @@ class BatchProjectConsolidator:
 
         return f"[Error: No se pudo leer el archivo con encodings comunes]"
 
-    def generate_consolidated_file(self, output_path: str, files: List[Path], mode_name: str, student_name: str = None):
+    def calculate_file_hash(self, content: str) -> str:
+        """
+        Calcula el hash SHA256 de un archivo
+        Normaliza el contenido removiendo espacios al inicio/final de líneas y líneas vacías
+        """
+        # Normalizar contenido: remover espacios al inicio/final de líneas
+        lines = [line.strip() for line in content.split('\n') if line.strip()]
+        normalized = '\n'.join(lines)
+
+        # Calcular hash SHA256
+        return hashlib.sha256(normalized.encode('utf-8')).hexdigest()
+
+    def calculate_project_hash(self, files_dict: Dict[str, str]) -> str:
+        """
+        Calcula el hash del proyecto completo
+        files_dict: {nombre_archivo: contenido}
+        """
+        # Ordenar archivos alfabéticamente para consistencia
+        sorted_files = sorted(files_dict.items())
+
+        # Concatenar todos los contenidos
+        combined = ''.join([f"{name}:{content}" for name, content in sorted_files])
+
+        # Calcular hash SHA256
+        return hashlib.sha256(combined.encode('utf-8')).hexdigest()
+
+    def extract_java_files_with_hashes(self, files: List[Path]) -> Tuple[Dict[str, str], Dict[str, str]]:
+        """
+        Extrae archivos .java y calcula sus hashes
+        Retorna: (archivos_dict, hashes_dict)
+        archivos_dict: {nombre_relativo: contenido}
+        hashes_dict: {nombre_relativo: hash}
+        """
+        archivos_dict = {}
+        hashes_dict = {}
+
+        for file_path in files:
+            if file_path.suffix == '.java':
+                relative_path = self.get_relative_path(file_path)
+                content = self.read_file_safely(file_path)
+
+                # Calcular hash del archivo
+                file_hash = self.calculate_file_hash(content)
+
+                archivos_dict[relative_path] = content
+                hashes_dict[relative_path] = file_hash
+
+        return archivos_dict, hashes_dict
+
+    def generate_consolidated_file(self, output_path: str, files: List[Path], mode_name: str, student_name: str = None, project_hash: str = None):
         """Genera el archivo consolidado en formato TXT (con sintaxis Markdown)"""
 
         with open(output_path, 'w', encoding='utf-8') as out_file:
@@ -142,6 +195,8 @@ class BatchProjectConsolidator:
             out_file.write(f"**Proyecto:** {self.project_path.name}\n\n")
             out_file.write(f"**Ruta:** `{self.project_path}`\n\n")
             out_file.write(f"**Modo de conversión:** {mode_name}\n\n")
+            if project_hash:
+                out_file.write(f"**Hash del proyecto:** `{project_hash[:16]}...`\n\n")
 
             # Metadata del proyecto
             out_file.write("## 📋 Metadata del Proyecto\n\n")
@@ -235,6 +290,230 @@ class BatchProjectConsolidator:
             out_file.write(f"\n... y {len(sorted_dirs) - 50} elementos más\n")
 
 
+class SimilarityDetector:
+    """Detecta copias totales y parciales entre proyectos"""
+
+    def __init__(self, consolidado_dir: Path):
+        self.consolidado_dir = consolidado_dir
+        self.database_path = consolidado_dir / "hashes_database.json"
+        self.report_path = consolidado_dir / "reporte_similitud.json"
+        self.database = self.load_database()
+
+    def load_database(self) -> Dict:
+        """Carga la base de datos de hashes o crea una nueva"""
+        if self.database_path.exists():
+            try:
+                with open(self.database_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception as e:
+                print(f"⚠️  Advertencia: No se pudo cargar la base de datos existente: {e}")
+                print("   Se creará una nueva base de datos.")
+
+        return {
+            "version": "1.0",
+            "ultima_actualizacion": None,
+            "total_proyectos": 0,
+            "proyectos": {}
+        }
+
+    def save_database(self):
+        """Guarda la base de datos de hashes"""
+        self.database["ultima_actualizacion"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        self.database["total_proyectos"] = len(self.database["proyectos"])
+
+        with open(self.database_path, 'w', encoding='utf-8') as f:
+            json.dump(self.database, f, indent=2, ensure_ascii=False)
+
+    def add_project(self, student_name: str, project_hash: str, file_hashes: Dict[str, str],
+                   total_files: int, total_lines: int):
+        """Agrega un proyecto a la base de datos"""
+        self.database["proyectos"][student_name] = {
+            "fecha_procesado": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            "hash_proyecto": project_hash,
+            "archivos": file_hashes,
+            "total_archivos": total_files,
+            "total_lineas": total_lines
+        }
+
+    def detect_similarities(self) -> Dict:
+        """
+        Detecta similitudes entre todos los proyectos en la base de datos
+        Retorna un diccionario con proyectos idénticos y copias parciales
+        """
+        proyectos = self.database["proyectos"]
+
+        # Diccionarios para agrupar resultados
+        identical_groups = defaultdict(list)  # {hash_proyecto: [lista_alumnos]}
+        file_hash_map = defaultdict(list)     # {hash_archivo: [(alumno, nombre_archivo)]}
+
+        # Agrupar proyectos idénticos por hash
+        for student, data in proyectos.items():
+            project_hash = data["hash_proyecto"]
+            identical_groups[project_hash].append(student)
+
+            # Mapear hashes de archivos individuales
+            for file_name, file_hash in data["archivos"].items():
+                file_hash_map[file_hash].append((student, file_name))
+
+        # Filtrar solo grupos con más de 1 proyecto (copias)
+        proyectos_identicos = []
+        for project_hash, students in identical_groups.items():
+            if len(students) > 1:
+                # Obtener datos del primer proyecto (todos son iguales)
+                first_student = students[0]
+                project_data = proyectos[first_student]
+
+                proyectos_identicos.append({
+                    "hash_proyecto": project_hash,
+                    "alumnos": sorted(students),
+                    "porcentaje_similitud": 100,
+                    "archivos_identicos": project_data["total_archivos"],
+                    "total_lineas": project_data["total_lineas"]
+                })
+
+        # Detectar copias parciales (archivos en común pero no 100% iguales)
+        copias_parciales = []
+        students_list = list(proyectos.keys())
+
+        for i, student_a in enumerate(students_list):
+            for student_b in students_list[i+1:]:
+                # Obtener archivos de ambos estudiantes
+                files_a = proyectos[student_a]["archivos"]
+                files_b = proyectos[student_b]["archivos"]
+
+                # Encontrar archivos con el mismo hash
+                common_files = []
+                for file_name_a, hash_a in files_a.items():
+                    for file_name_b, hash_b in files_b.items():
+                        if hash_a == hash_b:
+                            common_files.append({
+                                "nombre_a": file_name_a,
+                                "nombre_b": file_name_b,
+                                "hash": hash_a
+                            })
+
+                # Si tienen al menos 3 archivos en común y no son proyectos 100% idénticos
+                if len(common_files) >= 3:
+                    # Verificar que no sean proyectos idénticos (ya detectados)
+                    if proyectos[student_a]["hash_proyecto"] != proyectos[student_b]["hash_proyecto"]:
+                        # Calcular porcentaje de similitud
+                        total_files_min = min(len(files_a), len(files_b))
+                        porcentaje = (len(common_files) / total_files_min * 100) if total_files_min > 0 else 0
+
+                        copias_parciales.append({
+                            "alumnos": [student_a, student_b],
+                            "archivos_copiados": [
+                                {"nombre": cf["nombre_a"], "hash": cf["hash"][:16] + "..."}
+                                for cf in common_files
+                            ],
+                            "porcentaje_similitud": round(porcentaje, 1),
+                            "total_archivos_comunes": len(common_files)
+                        })
+
+        # Archivos más copiados (aparecen en 3 o más proyectos)
+        archivos_mas_copiados = []
+        for file_hash, occurrences in file_hash_map.items():
+            if len(set(student for student, _ in occurrences)) >= 3:  # Al menos 3 alumnos diferentes
+                students_with_file = list(set(student for student, _ in occurrences))
+                file_names = [name for _, name in occurrences]
+                most_common_name = max(set(file_names), key=file_names.count)
+
+                archivos_mas_copiados.append({
+                    "archivo": most_common_name,
+                    "hash": file_hash[:16] + "...",
+                    "aparece_en": sorted(students_with_file),
+                    "total_copias": len(students_with_file)
+                })
+
+        # Ordenar por número de copias (descendente)
+        archivos_mas_copiados.sort(key=lambda x: x["total_copias"], reverse=True)
+
+        return {
+            "proyectos_identicos": proyectos_identicos,
+            "copias_parciales": copias_parciales,
+            "archivos_mas_copiados": archivos_mas_copiados
+        }
+
+    def generate_similarity_report(self):
+        """Genera el reporte de similitud en formato JSON"""
+        similarities = self.detect_similarities()
+
+        report = {
+            "generado": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            "total_proyectos_analizados": self.database["total_proyectos"],
+            "total_grupos_identicos": len(similarities["proyectos_identicos"]),
+            "total_copias_parciales": len(similarities["copias_parciales"]),
+            "proyectos_identicos": similarities["proyectos_identicos"],
+            "copias_parciales": similarities["copias_parciales"],
+            "archivos_mas_copiados": similarities["archivos_mas_copiados"]
+        }
+
+        with open(self.report_path, 'w', encoding='utf-8') as f:
+            json.dump(report, f, indent=2, ensure_ascii=False)
+
+        return similarities
+
+    def print_similarity_summary(self, similarities: Dict):
+        """Imprime un resumen de similitudes en consola"""
+        print("\n" + "=" * 70)
+        print(f"  🔍 ANÁLISIS DE SIMILITUD ({self.database['total_proyectos']} proyectos en total)".center(70))
+        print("=" * 70)
+
+        # Proyectos idénticos
+        if similarities["proyectos_identicos"]:
+            print("\n⚠️  PROYECTOS IDÉNTICOS (100%):")
+            print("-" * 70)
+            for idx, grupo in enumerate(similarities["proyectos_identicos"], 1):
+                alumnos = ", ".join(grupo["alumnos"])
+                print(f"  Grupo {idx}: {alumnos}")
+                print(f"    • Hash: {grupo['hash_proyecto'][:8]}")
+                print(f"    • Archivos: {grupo['archivos_identicos']} idénticos")
+                print(f"    • Líneas: {grupo['total_lineas']:,}")
+                print()
+        else:
+            print("\n✅ No se detectaron proyectos 100% idénticos")
+
+        # Copias parciales
+        if similarities["copias_parciales"]:
+            print("\n⚠️  COPIAS PARCIALES (≥50% similitud):")
+            print("-" * 70)
+            for copia in similarities["copias_parciales"]:
+                if copia["porcentaje_similitud"] >= 50:  # Solo mostrar >= 50%
+                    alumnos = " ↔ ".join(copia["alumnos"])
+                    print(f"  {alumnos}")
+                    print(f"    • Similitud: {copia['porcentaje_similitud']}%")
+                    print(f"    • Archivos copiados: {copia['total_archivos_comunes']}")
+
+                    # Mostrar algunos archivos (máximo 5)
+                    archivos_mostrar = copia["archivos_copiados"][:5]
+                    archivos_nombres = [a["nombre"] for a in archivos_mostrar]
+                    print(f"    • Archivos: {', '.join(archivos_nombres)}", end="")
+                    if len(copia["archivos_copiados"]) > 5:
+                        print(f"... (+{len(copia['archivos_copiados']) - 5} más)")
+                    else:
+                        print()
+                    print()
+        else:
+            print("\n✅ No se detectaron copias parciales significativas")
+
+        # Archivos más copiados (mostrar top 5)
+        if similarities["archivos_mas_copiados"]:
+            print("\n📋 ARCHIVOS MÁS COPIADOS (Top 5):")
+            print("-" * 70)
+            for idx, archivo in enumerate(similarities["archivos_mas_copiados"][:5], 1):
+                print(f"  {idx}. {archivo['archivo']}")
+                print(f"     • Aparece en {archivo['total_copias']} proyectos")
+                alumnos = ", ".join(archivo["aparece_en"][:3])
+                if archivo['total_copias'] > 3:
+                    alumnos += f"... (+{archivo['total_copias'] - 3} más)"
+                print(f"     • Alumnos: {alumnos}")
+                print()
+
+        print(f"\n📋 Reporte detallado guardado en: {self.report_path.name}")
+        print(f"📋 Base de datos actualizada: {self.database_path.name}")
+        print("\n" + "=" * 70)
+
+
 class BatchProcessor:
     """Procesa múltiples entregas de alumnos automáticamente"""
 
@@ -242,6 +521,7 @@ class BatchProcessor:
         self.script_dir = script_dir
         self.entregas_dir = script_dir / "entregas"
         self.consolidado_dir = script_dir / "consolidado"
+        self.similarity_detector = None
 
     def find_zip_files(self, student_dir: Path) -> List[Path]:
         """Encuentra archivos ZIP en la carpeta del alumno"""
@@ -274,6 +554,10 @@ class BatchProcessor:
 
         # Crear carpeta consolidado si no existe
         self.consolidado_dir.mkdir(exist_ok=True)
+
+        # Inicializar detector de similitud
+        self.similarity_detector = SimilarityDetector(self.consolidado_dir)
+        print(f"\n📊 Base de datos cargada: {self.similarity_detector.database['total_proyectos']} proyectos existentes")
 
         # Obtener todas las carpetas de alumnos
         student_dirs = [d for d in self.entregas_dir.iterdir() if d.is_dir()]
@@ -333,15 +617,40 @@ class BatchProcessor:
 
                     print(f"   ✅ Archivos encontrados: {len(files)}")
 
-                    # Generar archivo consolidado en formato TXT
-                    output_filename = f"{student_name}.txt"
+                    # Extraer archivos .java y calcular hashes
+                    archivos_dict, file_hashes = consolidator.extract_java_files_with_hashes(files)
+
+                    if not archivos_dict:
+                        print(f"   ⚠️  No se encontraron archivos .java para análisis")
+                        failed += 1
+                        results.append((student_name, "Sin archivos .java", None))
+                        continue
+
+                    # Calcular hash del proyecto completo
+                    project_hash = consolidator.calculate_project_hash(archivos_dict)
+                    hash_corto = project_hash[:8]
+
+                    print(f"   🔑 Hash del proyecto: {hash_corto}")
+
+                    # Agregar a la base de datos de similitud
+                    self.similarity_detector.add_project(
+                        student_name,
+                        project_hash,
+                        file_hashes,
+                        len(archivos_dict),
+                        consolidator.stats.get('total_lines', 0)
+                    )
+
+                    # Generar archivo consolidado en formato TXT con hash en el nombre
+                    output_filename = f"{student_name}_{hash_corto}.txt"
                     output_path = self.consolidado_dir / output_filename
 
                     consolidator.generate_consolidated_file(
                         str(output_path),
                         files,
                         mode_name,
-                        student_name
+                        student_name,
+                        project_hash
                     )
 
                     # Información del archivo generado
@@ -380,6 +689,13 @@ class BatchProcessor:
                 print(f"{status_icon} {name}: {status}")
 
         print("\n" + "=" * 70)
+
+        # Guardar base de datos y generar reporte de similitud
+        if successful > 0:
+            print("\n🔍 Analizando similitudes entre proyectos...")
+            self.similarity_detector.save_database()
+            similarities = self.similarity_detector.generate_similarity_report()
+            self.similarity_detector.print_similarity_summary(similarities)
 
 
 def print_header():
@@ -436,6 +752,12 @@ def get_custom_extensions() -> Set[str]:
 
 def main():
     """Función principal"""
+    # Configurar UTF-8 para Windows
+    if sys.platform == 'win32':
+        import io
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
     print_header()
 
     # Obtener directorio donde está el script
