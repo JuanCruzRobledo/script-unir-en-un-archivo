@@ -12,6 +12,7 @@ import tempfile
 import shutil
 import hashlib
 import json
+import re
 from pathlib import Path
 from datetime import datetime
 from typing import List, Set, Dict, Tuple
@@ -523,6 +524,29 @@ class BatchProcessor:
         self.consolidado_dir = script_dir / "consolidado"
         self.similarity_detector = None
 
+    def sanitize_student_name(self, raw_name: str) -> str:
+        """Limpia el nombre de la carpeta de entrega para obtener el nombre del alumno.
+
+        - Remueve sufijos como _<id>_assignsubmission_file o _assignsubmission_file
+        - Reemplaza saltos de línea por espacios
+        - Colapsa múltiples espacios en uno y hace strip
+        - Si el resultado queda vacío, devuelve el raw_name stripped
+        """
+        if not raw_name:
+            return ""
+
+        # Reemplazar saltos de línea y tabs por espacios
+        name = re.sub(r"[\r\n\t]+", " ", raw_name)
+
+        # Remover sufijo tipo _123456_assignsubmission_file o _assignsubmission_file
+        name = re.sub(r"_[0-9]+_assignsubmission_file$", "", name)
+        name = re.sub(r"_assignsubmission_file$", "", name)
+
+        # Reemplazar múltiples espacios por uno y limpiar espacios alrededor
+        name = re.sub(r"\s+", " ", name).strip()
+
+        return name or raw_name.strip()
+
     def find_zip_files(self, student_dir: Path) -> List[Path]:
         """Encuentra archivos ZIP en la carpeta del alumno"""
         zip_files = list(student_dir.glob("*.zip"))
@@ -574,7 +598,8 @@ class BatchProcessor:
         results = []
 
         for student_dir in student_dirs:
-            student_name = student_dir.name
+            raw_student_name = student_dir.name
+            student_name = self.sanitize_student_name(raw_student_name)
             print(f"\n📂 Procesando: {student_name}")
             print("-" * 70)
 
@@ -632,7 +657,7 @@ class BatchProcessor:
 
                     print(f"   🔑 Hash del proyecto: {hash_corto}")
 
-                    # Agregar a la base de datos de similitud
+                    # Agregar a la base de datos de similitud (usar nombre sanitizado)
                     self.similarity_detector.add_project(
                         student_name,
                         project_hash,
@@ -641,9 +666,12 @@ class BatchProcessor:
                         consolidator.stats.get('total_lines', 0)
                     )
 
-                    # Generar archivo consolidado en formato TXT con hash en el nombre
-                    output_filename = f"{student_name}_{hash_corto}.txt"
-                    output_path = self.consolidado_dir / output_filename
+                    # Generar archivo consolidado dentro de una carpeta por alumno
+                    # Nombre fijo del archivo de salida: entrega.txt
+                    student_output_dir = self.consolidado_dir / student_name
+                    student_output_dir.mkdir(parents=True, exist_ok=True)
+
+                    output_path = student_output_dir / "entrega.txt"
 
                     consolidator.generate_consolidated_file(
                         str(output_path),
@@ -656,7 +684,7 @@ class BatchProcessor:
                     # Información del archivo generado
                     file_size_kb = output_path.stat().st_size / 1024
 
-                    print(f"   💾 Archivo generado: {output_filename}")
+                    print(f"   💾 Archivo generado: {output_path.relative_to(self.consolidado_dir)}")
                     print(f"   📊 Estadísticas:")
                     print(f"      • Archivos procesados: {consolidator.stats['total_files']}")
                     print(f"      • Líneas totales: {consolidator.stats['total_lines']:,}")
@@ -667,6 +695,7 @@ class BatchProcessor:
                     results.append((student_name, "Exitoso", consolidator.stats))
 
             except Exception as e:
+                # En caso de error, usar el nombre sanitizado para los logs/resultados
                 print(f"   ❌ Error procesando {student_name}: {str(e)}")
                 failed += 1
                 results.append((student_name, f"Error: {str(e)}", None))
