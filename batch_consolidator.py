@@ -382,33 +382,36 @@ class SimilarityDetector:
                 files_a = proyectos[student_a]["archivos"]
                 files_b = proyectos[student_b]["archivos"]
 
-                # Encontrar archivos con el mismo hash
-                common_files = []
-                for file_name_a, hash_a in files_a.items():
-                    for file_name_b, hash_b in files_b.items():
-                        if hash_a == hash_b:
-                            common_files.append({
-                                "nombre_a": file_name_a,
-                                "nombre_b": file_name_b,
-                                "hash": hash_a
-                            })
+                # Encontrar hashes únicos compartidos (no producto cartesiano)
+                hashes_a = set(files_a.values())
+                hashes_b = set(files_b.values())
+                common_hashes = hashes_a & hashes_b  # Intersección de sets
 
                 # Si tienen al menos 3 archivos en común y no son proyectos 100% idénticos
-                if len(common_files) >= 3:
+                if len(common_hashes) >= 3:
                     # Verificar que no sean proyectos idénticos (ya detectados)
                     if proyectos[student_a]["hash_proyecto"] != proyectos[student_b]["hash_proyecto"]:
-                        # Calcular porcentaje de similitud
-                        total_files_min = min(len(files_a), len(files_b))
-                        porcentaje = (len(common_files) / total_files_min * 100) if total_files_min > 0 else 0
+                        # Calcular porcentaje de similitud basado en hashes únicos
+                        total_files_min = min(len(hashes_a), len(hashes_b))
+                        porcentaje = (len(common_hashes) / total_files_min * 100) if total_files_min > 0 else 0
+
+                        # Construir lista de archivos copiados (un ejemplo por hash)
+                        archivos_copiados = []
+                        for common_hash in common_hashes:
+                            # Encontrar un archivo con este hash en student_a
+                            for file_name_a, hash_a in files_a.items():
+                                if hash_a == common_hash:
+                                    archivos_copiados.append({
+                                        "nombre": file_name_a,
+                                        "hash": common_hash[:16] + "..."
+                                    })
+                                    break  # Solo necesitamos un ejemplo por hash
 
                         copias_parciales.append({
                             "alumnos": [student_a, student_b],
-                            "archivos_copiados": [
-                                {"nombre": cf["nombre_a"], "hash": cf["hash"][:16] + "..."}
-                                for cf in common_files
-                            ],
+                            "archivos_copiados": archivos_copiados,
                             "porcentaje_similitud": round(porcentaje, 1),
-                            "total_archivos_comunes": len(common_files)
+                            "total_archivos_comunes": len(common_hashes)
                         })
 
         # Archivos más copiados (aparecen en 3 o más proyectos)

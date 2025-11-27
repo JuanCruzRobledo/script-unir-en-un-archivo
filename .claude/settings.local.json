@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(python batch_consolidator.py:*)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(dir:*)"
     ],
     "deny": [],
     "ask": []
